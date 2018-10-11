@@ -1,0 +1,300 @@
+//
+// Copyright (c) 2016-2017 Contributors to the Eclipse Foundation
+//
+// See the NOTICES file(s) distributed with this work for additional
+// information regarding copyright ownership.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+# MicroProfile JWT Integration with Java EE 8 Security API
+
+This proposal for using https://javaee.github.io/security-spec/spec/jsr375-spec.html[Java EE Security API Specification]. The main integration point is through the `HttpAuthenticationMechanism`:
+
+[source,java]
+----
+package javax.security.enterprise.authentication.mechanism.http;
+
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+public interface HttpAuthenticationMechanism {
+    /**
+     * Authenticate an HTTP request.
+     * 
+     * This method is called in response to an HTTP client request for a resource, and is always invoked 
+     * before any {@link Filter} or {@link HttpServlet}. Additionally this method is called
+     * in response to {@link HttpServletRequest#authenticate(HttpServletResponse)}
+     * 
+     * Note that by default this method is <strong>always</strong> called for every request, independent of whether
+     * the request is to a protected or non-protected resource, or whether a caller was successfully authenticated
+     * before within the same HTTP session or not.
+     * 
+     * A CDI/Interceptor spec interceptor can be used to prevent calls to this method if needed. 
+     * See {@link AutoApplySession} and {@link RememberMe} for two examples.
+     * 
+     * @param request contains the request the client has made
+     * @param response contains the response that will be send to the client
+     * @param httpMessageContext context for interacting with the container
+     * @return the completion status of the processing performed by this method
+     * @throws AuthenticationException when the processing failed
+     */
+    AuthenticationStatus validateRequest(HttpServletRequest request, HttpServletResponse response, HttpMessageContext httpMessageContext) throws AuthenticationException;
+    
+    ...
+}
+----
+
+An example HttpAuthenticationMechanism implementation from Payara:
+[source,java]
+----
+
+import static javax.security.enterprise.identitystore.CredentialValidationResult.Status.VALID;
+
+import javax.enterprise.inject.spi.CDI;
+import javax.security.enterprise.AuthenticationException;
+import javax.security.enterprise.AuthenticationStatus;
+import javax.security.enterprise.authentication.mechanism.http.HttpAuthenticationMechanism;
+import javax.security.enterprise.authentication.mechanism.http.HttpMessageContext;
+import javax.security.enterprise.identitystore.CredentialValidationResult;
+import javax.security.enterprise.identitystore.IdentityStore;
+import javax.security.enterprise.identitystore.IdentityStoreHandler;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+/**
+ * This authentication mechanism reads a JWT token from an HTTP header and passes it
+ * to an {@link IdentityStore} for validation. 
+ * 
+ * @author Arjan Tijms
+ */
+public class JWTAuthenticationMechanism implements HttpAuthenticationMechanism {
+
+    @Override
+    public AuthenticationStatus validateRequest(HttpServletRequest request, HttpServletResponse response, HttpMessageContext httpMessageContext) throws AuthenticationException {
+
+        if (httpMessageContext.isProtected()) {
+            IdentityStoreHandler identityStoreHandler = CDI.current().select(IdentityStoreHandler.class).get();
+            
+            SignedJWTCredential credential = getCredential(request);
+            
+            if (credential != null) {
+                
+                CredentialValidationResult result = identityStoreHandler.validate(credential);
+                if (result.getStatus() == VALID) {
+                    httpMessageContext.getClientSubject()
+                                      .getPrincipals()
+                                      .add(result.getCallerPrincipal());
+                }
+                
+                return httpMessageContext.notifyContainerAboutLogin(result);
+            }
+        }
+        
+        return httpMessageContext.doNothing();
+    }
+
+    private SignedJWTCredential getCredential(HttpServletRequest request) {
+
+        String authorizationHeader = request.getHeader("Authorization");
+        if (authorizationHeader != null && authorizationHeader.startsWith("Bearer ")) {
+            String token = authorizationHeader.substring("Bearer ".length());
+            if (token != null && !token.isEmpty()) {
+                return new SignedJWTCredential(token);
+            }
+        }
+
+        return null;
+    }
+
+}
+
+----
+
+The corresponding IdentityStoreHandler implementation highlights are:
+[source,java]
+----
+
+import fish.payara.microprofile.jwtauth.jwt.JsonWebTokenImpl;
+import fish.payara.microprofile.jwtauth.jwt.JwtTokenParser;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.StringReader;
+import static java.lang.Thread.currentThread;
+import java.math.BigInteger;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.security.KeyFactory;
+import java.security.PublicKey;
+import java.security.spec.RSAPublicKeySpec;
+import java.security.spec.X509EncodedKeySpec;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Optional;
+import java.util.Properties;
+import static java.util.logging.Level.FINEST;
+import java.util.logging.Logger;
+import javax.enterprise.inject.spi.DeploymentException;
+import javax.json.Json;
+import javax.json.JsonArray;
+import javax.json.JsonObject;
+import javax.security.enterprise.identitystore.CredentialValidationResult;
+import static javax.security.enterprise.identitystore.CredentialValidationResult.INVALID_RESULT;
+import javax.security.enterprise.identitystore.IdentityStore;
+import org.eclipse.microprofile.config.Config;
+import org.eclipse.microprofile.config.ConfigProvider;
+import static org.eclipse.microprofile.jwt.config.Names.ISSUER;
+import static org.eclipse.microprofile.jwt.config.Names.VERIFIER_PUBLIC_KEY;
+import static org.eclipse.microprofile.jwt.config.Names.VERIFIER_PUBLIC_KEY_LOCATION;
+
+/**
+ * Identity store capable of asserting that a signed JWT token is valid according to
+ * the MP-JWT 1.0 spec.
+ * 
+ * @author Arjan Tijms
+ */
+public class SignedJWTIdentityStore implements IdentityStore {
+    
+    private static final Logger LOGGER = Logger.getLogger(SignedJWTIdentityStore.class.getName());
+
+    private static final String RSA_ALGORITHM = "RSA";
+
+    private final JwtTokenParser jwtTokenParser = new JwtTokenParser();
+
+    private final String acceptedIssuer;
+
+    private final Config config;
+    
+    public SignedJWTIdentityStore() {
+        config = ConfigProvider.getConfig();
+        acceptedIssuer = readVendorIssuer()
+                .orElseGet(() -> config.getOptionalValue(ISSUER, String.class)
+                .orElseThrow(() -> new IllegalStateException("No issuer found")));
+    }
+    
+    public CredentialValidationResult validate(SignedJWTCredential signedJWTCredential) {
+        try {
+
+            Optional<PublicKey> publicKey = readPublicKeyFromLocation("/publicKey.pem");
+            if (!publicKey.isPresent()) {
+                publicKey = readMPEmbeddedPublicKey();
+            }
+            if (!publicKey.isPresent()) {
+                publicKey = readMPPublicKeyFromLocation();
+            }
+            if (!publicKey.isPresent()) {
+                throw new IllegalStateException("No PublicKey found");
+            }
+
+            JsonWebTokenImpl jsonWebToken
+                    = jwtTokenParser.parse(
+                            signedJWTCredential.getSignedJWT(),
+                            acceptedIssuer,
+                            publicKey.get()
+                    );
+            
+            List<String> groups = new ArrayList<>(
+                    jsonWebToken.getClaim("groups"));
+            
+            return new CredentialValidationResult(
+                    jsonWebToken, 
+                    new HashSet<>(groups));
+            
+        } catch (Exception e) {
+            LOGGER.log(FINEST, "Exception trying to parse JWT token.", e);
+        }
+
+        return INVALID_RESULT;
+    }
+
+
+    private Optional<PublicKey> readMPEmbeddedPublicKey() throws Exception {
+        Optional<String> key = config.getOptionalValue(VERIFIER_PUBLIC_KEY, String.class);
+        if (!key.isPresent()) {
+            return Optional.empty();
+        }
+        return createPublicKey(key.get());
+    }
+
+    private Optional<PublicKey> readMPPublicKeyFromLocation() throws Exception {
+        Optional<String> locationOpt = config.getOptionalValue(VERIFIER_PUBLIC_KEY_LOCATION, String.class);
+
+        if (!locationOpt.isPresent()) {
+            return Optional.empty();
+        }
+
+        String publicKeyLocation = locationOpt.get();
+
+        return readPublicKeyFromLocation(publicKeyLocation);
+    }
+
+    private Optional<PublicKey> readPublicKeyFromLocation(String publicKeyLocation) throws Exception {
+
+        URL publicKeyURL = currentThread().getContextClassLoader().getResource(publicKeyLocation);
+        ...
+        byte[] byteBuffer = new byte[16384];
+        int length = publicKeyURL.openStream()
+                .read(byteBuffer);
+        String key = new String(byteBuffer, 0, length);
+        return createPublicKey(key);
+    }
+
+
+    private Optional<PublicKey> createPublicKey(String key) throws Exception {
+        try {
+            return Optional.of(createPublicKeyFromPem(key));
+        } catch (Exception pemEx) {
+            try {
+                return Optional.of(createPublicKeyFromJWKS(key));
+            } catch (Exception jwksEx) {
+                throw new DeploymentException(jwksEx);
+            }
+        }
+    }
+
+    private PublicKey createPublicKeyFromPem(String key) throws Exception {
+...
+    }
+
+    private PublicKey createPublicKeyFromJWKS(String jwksValue) throws Exception {
+...
+        Integer modulus = new BigInteger(1, modulusBytes);
+
+        RSAPublicKeySpec publicKeySpec = new RSAPublicKeySpec(modulus, exponent);
+        return KeyFactory.getInstance(RSA_ALGORITHM)
+                .generatePublic(publicKeySpec);
+    }
+
+    private JsonObject parseJwks(String jwksValue) throws Exception {
+        JsonObject jwks;
+        try {
+            jwks = Json.createReader(new StringReader(jwksValue)).readObject();
+        } catch (Exception ex) {
+            // if jwks is encoded
+            byte[] jwksDecodedValue = Base64.getDecoder().decode(jwksValue);
+            try (InputStream jwksStream = new ByteArrayInputStream(jwksDecodedValue)) {
+                jwks = Json.createReader(jwksStream)
+                        .readObject();
+            }
+        }
+        return jwks;
+    }
+
+}
+
+----
+
+TODO: CDI registration of the HttpAuthenticationMechanism
